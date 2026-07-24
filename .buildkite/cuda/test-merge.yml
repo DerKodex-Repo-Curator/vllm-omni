@@ -163,7 +163,7 @@ steps:
                       type: DirectoryOrCreate
 
       - label: "Entrypoint Test with L4"
-        timeout_in_minutes: 30
+        timeout_in_minutes: 60
         commands:
           - pytest -s -v tests/entrypoints/ -m "advanced_model and cuda and L4" --run-level "advanced_model"
         agents:

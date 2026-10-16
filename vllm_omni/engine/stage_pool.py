@@ -862,7 +862,7 @@ class StagePool:
 
     def _infer_audio_sample_rate(
         self,
-        mm_output: dict[str, Any] | None = None,
+        mm_output: Mapping[str, Any] | None = None,
         *,
         use_default: bool = True,
     ) -> int:
@@ -1061,8 +1061,7 @@ class StagePool:
                 f"stage {self.stage_id} replica {expected_replica_id} keyed by {request_id} became "
                 "unavailable before submit"
             )
-        client = self.clients[replica_id]
-        if client is None:
+        if self.clients[replica_id] is None:
             raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
         try:
             self.output_processor.add_request(
@@ -1078,19 +1077,33 @@ class StagePool:
 
         try:
             await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
-        except Exception:
-            self.release_binding(request_id)
-            rollback = getattr(self.output_processor, "remove_request", None)
-            if callable(rollback):
-                try:
-                    rollback(request_id)
-                except Exception as rollback_error:
-                    logger.warning(
-                        "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
-                        request_id,
-                        self.stage_id,
-                        rollback_error,
-                    )
+        except BaseException:
+            # Sending can fail or be cancelled after the engine accepted the
+            # request. Abort while its replica binding is still available.
+            try:
+                await self.abort_requests([request_id])
+            except (Exception, asyncio.CancelledError) as abort_error:
+                # Keep routing and processor state so owner cleanup can retry.
+                # A second cancellation must not replace the submission error.
+                logger.warning(
+                    "[StagePool] Failed to abort rejected submission for req=%s stage-%s: %r",
+                    request_id,
+                    self.stage_id,
+                    abort_error,
+                )
+            else:
+                self.release_binding(request_id)
+                rollback = getattr(self.output_processor, "remove_request", None)
+                if callable(rollback):
+                    try:
+                        rollback(request_id)
+                    except Exception as rollback_error:
+                        logger.warning(
+                            "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
+                            request_id,
+                            self.stage_id,
+                            rollback_error,
+                        )
             raise
         return replica_id
 
@@ -1307,7 +1320,7 @@ class StagePool:
         request_ids_by_replica: dict[int, list[str]] = {}
         for request_id in request_ids:
             replica_id = self.get_bound_replica_id(request_id)
-            if replica_id is None or self.clients[replica_id] is None:
+            if replica_id is None:
                 logger.debug("[StagePool] abort: no live binding for req=%s in stage-%s", request_id, self.stage_id)
                 continue
             request_ids_by_replica.setdefault(replica_id, []).append(request_id)
@@ -1342,9 +1355,10 @@ class StagePool:
                     if aborted:
                         engine_abort_ids = list(aborted)
             client = self.clients[replica_id]
-            if client is None:
-                continue
-            await client.abort_requests_async(engine_abort_ids)
+            if client is not None:
+                await client.abort_requests_async(engine_abort_ids)
+            # An evicted engine cannot produce further output. Release its
+            # retained processor state without sending another abort RPC.
             if not is_diffusion and self._output_processor is not None:
                 commit = getattr(self._output_processor, "commit_aborted_request_state", None)
                 if callable(commit):

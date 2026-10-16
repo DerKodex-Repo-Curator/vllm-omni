@@ -1328,10 +1328,9 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             vllm_config=vllm_config,
             prefix=_maybe_prefix(prefix, "model"),
         )
-        from .fused_ops import fuse_qwen3_qk_norm_rope
+        from .fused_ops import fuse_qwen3_backbone
 
-        fused = fuse_qwen3_qk_norm_rope(self.model, vllm_config)
-        logger.info("MOSS Local backbone fused Q/K norm + RoPE: %d layers", fused)
+        logger.info("MOSS Local backbone explicit kernels: %s", fuse_qwen3_backbone(self.model, vllm_config))
 
         # Real text LM head -- loaded from the checkpoint but never consulted
         # at inference (see class docstring); kept purely as a destination

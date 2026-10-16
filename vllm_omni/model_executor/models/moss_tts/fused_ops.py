@@ -176,46 +176,244 @@ def add_layer_norm(
     return res, out
 
 
+@triton.jit
+def _rms_norm(
+    x_ptr,
+    r_ptr,
+    w_ptr,
+    out_ptr,
+    res_ptr,
+    sx,
+    sr,
+    N: tl.constexpr,
+    eps,
+    BN: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    USE_PDL: tl.constexpr,
+):
+    if USE_PDL:
+        _gdc_wait()
+        _gdc_launch()
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BN)
+    m = cols < N
+    x = tl.load(x_ptr + row * sx + cols, m, 0.0).to(tl.float32)
+    if HAS_RESIDUAL:
+        x = x + tl.load(r_ptr + row * sr + cols, m, 0.0).to(tl.float32)
+        tl.store(res_ptr + row * N + cols, x.to(res_ptr.dtype.element_ty), m)
+    rstd = tl.rsqrt(tl.sum(x * x, 0) / N + eps)
+    # as vLLM's rms_norm: normalize in FP32, round, then scale by the weight
+    y = (x * rstd).to(out_ptr.dtype.element_ty).to(tl.float32) * tl.load(w_ptr + cols, m, 0.0).to(tl.float32)
+    tl.store(out_ptr + row * N + cols, y.to(out_ptr.dtype.element_ty), m)
+
+
+def rms_norm(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, residual: torch.Tensor | None = None
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """vLLM ``RMSNorm`` (``fused_add_rms_norm`` with ``residual``) as one PDL-launched kernel."""
+    N = x.shape[-1]
+    x2 = x.reshape(-1, N)
+    rows = x2.shape[0]
+    out = torch.empty((rows, N), dtype=x.dtype, device=x.device)
+    res = None
+    if residual is not None:
+        r2 = residual.reshape(-1, N)
+        res = torch.empty_like(out)
+    if rows:
+        _rms_norm[(rows,)](
+            x2,
+            r2 if residual is not None else x2,
+            weight,
+            out,
+            res if res is not None else out,
+            x2.stride(0),
+            r2.stride(0) if residual is not None else 0,
+            N,
+            eps,
+            triton.next_power_of_2(N),
+            residual is not None,
+            USE_PDL=_USE_PDL,
+            launch_pdl=_USE_PDL,
+            num_warps=4 if N <= 4096 else 8,
+        )
+    if residual is None:
+        return out.view(x.shape)
+    return out.view(x.shape), res.view(residual.shape)
+
+
+@triton.jit
+def _silu_and_mul(
+    x_ptr,
+    out_ptr,
+    sx,
+    D: tl.constexpr,
+    BLOCK: tl.constexpr,
+    USE_PDL: tl.constexpr,
+):
+    if USE_PDL:
+        _gdc_wait()
+        _gdc_launch()
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    m = cols < D
+    g = tl.load(x_ptr + row * sx + cols, m, 0.0).to(tl.float32)
+    u = tl.load(x_ptr + row * sx + D + cols, m, 0.0).to(tl.float32)
+    # as F.silu(gate) * up on BF16 tensors: two roundings
+    act = (g / (1.0 + tl.exp(-g))).to(out_ptr.dtype.element_ty).to(tl.float32)
+    tl.store(out_ptr + row * D + cols, (act * u).to(out_ptr.dtype.element_ty), m)
+
+
+def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
+    """``silu(x[..., :d]) * x[..., d:]`` as one PDL-launched kernel."""
+    d = x.shape[-1] // 2
+    x2 = x.reshape(-1, x.shape[-1])
+    out = torch.empty((x2.shape[0], d), dtype=x.dtype, device=x.device)
+    if x2.shape[0]:
+        block = 1024
+        _silu_and_mul[(x2.shape[0], triton.cdiv(d, block))](
+            x2, out, x2.stride(0), d, block, USE_PDL=_USE_PDL, launch_pdl=_USE_PDL, num_warps=4
+        )
+    return out.view(*x.shape[:-1], d)
+
+
+@triton.jit
+def _qk_norm_rope(
+    qkv_ptr,
+    pos_ptr,
+    qw_ptr,
+    kw_ptr,
+    cache_ptr,
+    sqkv,
+    scache,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    D: tl.constexpr,
+    eps,
+    BH: tl.constexpr,
+    USE_PDL: tl.constexpr,
+):
+    if USE_PDL:
+        _gdc_wait()
+        _gdc_launch()
+    t = tl.program_id(0).to(tl.int64)
+    heads = tl.program_id(1) * BH + tl.arange(0, BH)
+    hmask = (heads < HQ + HK)[:, None]
+    half: tl.constexpr = D // 2
+    i = tl.arange(0, half)
+    pos = tl.load(pos_ptr + t)
+    cos = tl.load(cache_ptr + pos * scache + i).to(tl.float32)[None, :]
+    sin = tl.load(cache_ptr + pos * scache + half + i).to(tl.float32)[None, :]
+    base = qkv_ptr + t * sqkv + heads[:, None] * D + i[None, :]
+    x1 = tl.load(base, hmask, 0.0).to(tl.float32)
+    x2 = tl.load(base + half, hmask, 0.0).to(tl.float32)
+    rstd = tl.rsqrt((tl.sum(x1 * x1, 1) + tl.sum(x2 * x2, 1)) / D + eps)[:, None]
+    is_q = (heads < HQ)[:, None]
+    w1 = tl.where(is_q, tl.load(qw_ptr + i)[None, :], tl.load(kw_ptr + i)[None, :]).to(tl.float32)
+    w2 = tl.where(is_q, tl.load(qw_ptr + half + i)[None, :], tl.load(kw_ptr + half + i)[None, :]).to(tl.float32)
+    dtype = qkv_ptr.dtype.element_ty
+    # vLLM rms_norm per head (normalize, round, scale, round), then NeoX RoPE
+    n1 = ((x1 * rstd).to(dtype).to(tl.float32) * w1).to(dtype).to(tl.float32)
+    n2 = ((x2 * rstd).to(dtype).to(tl.float32) * w2).to(dtype).to(tl.float32)
+    tl.store(base, (n1 * cos - n2 * sin).to(dtype), hmask)
+    tl.store(base + half, (n2 * cos + n1 * sin).to(dtype), hmask)
+
+
+def qk_norm_rope_(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+) -> None:
+    """Per-head RMSNorm of Q and K, then NeoX RoPE, in place on ``qkv`` (T, (Hq + 2 Hk) * D)."""
+    tokens = qkv.shape[0]
+    if tokens:
+        heads = num_heads + num_kv_heads
+        bh = 8
+        _qk_norm_rope[(tokens, triton.cdiv(heads, bh))](
+            qkv,
+            positions,
+            q_weight,
+            k_weight,
+            cos_sin_cache,
+            qkv.stride(0),
+            cos_sin_cache.stride(0),
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            eps,
+            bh,
+            USE_PDL=_USE_PDL,
+            launch_pdl=_USE_PDL,
+            num_warps=4,
+        )
+
+
 def _qwen3_attention_fused_forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
     """``Qwen3Attention.forward`` with Q/K RMSNorm and RoPE as one in-place kernel."""
     qkv, _ = self.qkv_proj(hidden_states)
-    torch.ops._C.fused_qk_norm_rope(
+    qk_norm_rope_(
         qkv,
+        positions,
         self.num_heads,
-        self.num_kv_heads,
         self.num_kv_heads,
         self.head_dim,
         self.q_norm.variance_epsilon,
         self.q_norm.weight,
         self.k_norm.weight,
         self.rotary_emb.cos_sin_cache,
-        self.rotary_emb.is_neox_style,
-        positions,
     )
     q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
     output, _ = self.o_proj(self.attn(q, k, v))
     return output
 
 
-def fuse_qwen3_qk_norm_rope(model: torch.nn.Module, vllm_config) -> int:
-    """Route every Qwen3 attention of ``model`` through vLLM's fused Q/K norm + RoPE op.
+def _rms_norm_forward(self, x: torch.Tensor, residual: torch.Tensor | None = None):
+    return rms_norm(x, self.weight, self.variance_epsilon, residual)
 
-    vLLM applies this op only as a compile pass; without compilation the
-    three ops run separately. Only for an uncompiled CUDA BF16/FP16 model.
+
+def _silu_and_mul_forward(self, x: torch.Tensor) -> torch.Tensor:
+    return silu_and_mul(x)
+
+
+def fuse_qwen3_backbone(model: torch.nn.Module, vllm_config) -> dict[str, int]:
+    """Route an uncompiled Qwen3 backbone through the PDL-launched kernels above.
+
+    Without compilation vLLM runs its CUDA custom ops for RMSNorm, SiLU-and-mul
+    and the Q/K norm + RoPE; at decode sizes they are slower than the kernels
+    Inductor generates. Only for an uncompiled CUDA BF16/FP16 model; the
+    attention, GEMMs and KV cache stay vLLM's.
     """
     from vllm.config import CompilationMode
+    from vllm.model_executor.layers.activation import SiluAndMul
+    from vllm.model_executor.layers.layernorm import RMSNorm
     from vllm.model_executor.models.qwen3 import Qwen3Attention
 
+    counts = {"attention": 0, "rms_norm": 0, "silu_and_mul": 0}
     if (
         vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
         or not current_platform.is_cuda()
         or vllm_config.model_config.dtype not in (torch.bfloat16, torch.float16)
-        or not hasattr(torch.ops._C, "fused_qk_norm_rope")
     ):
-        return 0
-    count = 0
+        return counts
     for module in model.modules():
-        if isinstance(module, Qwen3Attention) and getattr(module.rotary_emb, "cos_sin_cache", None) is not None:
+        rope = getattr(module, "rotary_emb", None)
+        if (
+            isinstance(module, Qwen3Attention)
+            and getattr(rope, "is_neox_style", False)
+            and getattr(rope, "rotary_dim", module.head_dim) == module.head_dim
+            and getattr(rope, "cos_sin_cache", None) is not None
+        ):
             module.forward = _qwen3_attention_fused_forward.__get__(module)
-            count += 1
-    return count
+            counts["attention"] += 1
+        elif type(module) is RMSNorm and module.has_weight and module.variance_size_override is None:
+            module.forward = _rms_norm_forward.__get__(module)
+            counts["rms_norm"] += 1
+        elif type(module) is SiluAndMul:
+            module.forward = _silu_and_mul_forward.__get__(module)
+            counts["silu_and_mul"] += 1
+    return counts

@@ -150,7 +150,6 @@ def _cuda_models():
 
     model, embeddings, heads, stop_head = _models(12, "cuda", torch.bfloat16)
     model.prepare_qkv_lookup(embeddings, 12)
-    model.setup_compile()
     return model, embeddings, heads, stop_head
 
 

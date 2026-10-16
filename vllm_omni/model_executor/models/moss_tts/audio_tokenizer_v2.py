@@ -31,6 +31,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.modeling_utils import PreTrainedAudioTokenizerBase
 from transformers.utils import ModelOutput, auto_docstring, logging
+from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 
 from .configuration_moss_audio_tokenizer_v2 import MossAudioTokenizerConfig
 
@@ -974,10 +976,8 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         dim_per_head = self.embed_dim // self.num_heads
         projected = projected.reshape(B, T, 3, self.num_heads, dim_per_head)
         table = execution_context.rope_table if execution_context is not None and self.rope else None
-        if table is not None and projected.is_cuda and not torch.compiler.is_compiling():
+        if table is not None and projected.is_cuda:
             # One kernel rotates Q and K in place from the stage's shared table.
-            from .fused_ops import rope_qk_
-
             rope_qk_(projected, *table)
             projected = projected.permute(2, 0, 3, 1, 4)
             q, k, v = projected[0], projected[1], projected[2]
@@ -1324,6 +1324,144 @@ def _(x: torch.Tensor, weight: torch.Tensor, zero_bias: torch.Tensor) -> torch.T
     return x.new_empty((x.shape[0], weight.shape[0]), dtype=weight.dtype)
 
 
+_USE_PDL = current_platform.is_cuda() and current_platform.has_device_capability(90)
+
+
+@triton.jit
+def _rope_qk(
+    qkv_ptr,
+    cos_ptr,
+    sin_ptr,
+    frames,
+    s_b,
+    s_t,
+    s_c,
+    s_h,
+    c_b,
+    c_t,
+    H: tl.constexpr,  # noqa: N803
+    BH: tl.constexpr,  # noqa: N803
+    HALF: tl.constexpr,  # noqa: N803
+    USE_PDL: tl.constexpr,  # noqa: N803
+):
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    pid = tl.program_id(0)
+    b = pid // frames
+    t = pid - b * frames
+    i = tl.arange(0, HALF)
+    cos = tl.load(cos_ptr + b * c_b + t * c_t + i)
+    sin = tl.load(sin_ptr + b * c_b + t * c_t + i)
+    h = tl.arange(0, BH)
+    mask = (h < H)[:, None]
+    base = qkv_ptr + b.to(tl.int64) * s_b + t.to(tl.int64) * s_t + h[:, None] * s_h + 2 * i[None, :]
+    for c in tl.static_range(2):
+        ptr = base + c * s_c
+        re = tl.load(ptr, mask).to(tl.float32)
+        im = tl.load(ptr + 1, mask).to(tl.float32)
+        tl.store(ptr, (re * cos[None, :] - im * sin[None, :]).to(qkv_ptr.dtype.element_ty), mask)
+        tl.store(ptr + 1, (re * sin[None, :] + im * cos[None, :]).to(qkv_ptr.dtype.element_ty), mask)
+
+
+def rope_qk_(qkv: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> None:
+    """``apply_rope`` on Q and K of the projection ``qkv`` (B, T, 3, H, D), in place, one kernel.
+
+    ``cos``/``sin`` are the FP32 (B, 1, T, D/2) table of ``rope_angles``. The
+    rotation is computed in FP32 and rounded once, as ``apply_rope`` does.
+    """
+    B, T, three, H, D = qkv.shape
+    assert three == 3 and qkv.stride(4) == 1 and D % 2 == 0
+    assert cos.shape == (B, 1, T, D // 2) and cos.stride(3) == 1 and sin.stride() == cos.stride()
+    if B * T:
+        _rope_qk[(B * T,)](
+            qkv,
+            cos,
+            sin,
+            T,
+            qkv.stride(0),
+            qkv.stride(1),
+            qkv.stride(2),
+            qkv.stride(3),
+            cos.stride(0),
+            cos.stride(2),
+            H,
+            triton.next_power_of_2(H),
+            D // 2,
+            USE_PDL=_USE_PDL,
+            launch_pdl=_USE_PDL,
+            num_warps=4,
+        )
+
+
+@triton.jit
+def _add_layer_norm(
+    x_ptr,
+    u_ptr,
+    scale_ptr,
+    w_ptr,
+    b_ptr,
+    res_ptr,
+    out_ptr,
+    N: tl.constexpr,  # noqa: N803
+    eps,
+    BN: tl.constexpr,  # noqa: N803
+    HAS_UPDATE: tl.constexpr,  # noqa: N803
+    HAS_BIAS: tl.constexpr,  # noqa: N803
+    USE_PDL: tl.constexpr,  # noqa: N803
+):
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BN)
+    m = cols < N
+    x = tl.load(x_ptr + row * N + cols, m, 0.0).to(tl.float32)
+    if HAS_UPDATE:
+        u = tl.load(u_ptr + row * N + cols, m, 0.0).to(tl.float32)
+        # torch.addcmul(x, update, scale): one rounding to the residual dtype
+        r = (x + u * tl.load(scale_ptr + cols, m, 0.0).to(tl.float32)).to(res_ptr.dtype.element_ty)
+        tl.store(res_ptr + row * N + cols, r, m)
+        x = r.to(tl.float32)
+    mean = tl.sum(x, 0) / N
+    xc = tl.where(m, x - mean, 0.0)
+    y = xc * tl.rsqrt(tl.sum(xc * xc, 0) / N + eps) * tl.load(w_ptr + cols, m, 0.0).to(tl.float32)
+    if HAS_BIAS:
+        y = y + tl.load(b_ptr + cols, m, 0.0).to(tl.float32)
+    tl.store(out_ptr + row * N + cols, y.to(out_ptr.dtype.element_ty), m)
+
+
+def add_layer_norm(
+    x: torch.Tensor, update: torch.Tensor | None, scale: torch.Tensor | None, norm: nn.LayerNorm
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(r, norm(r))`` with ``r = torch.addcmul(x, update, scale)`` (``x`` without an update), one kernel."""
+    N = x.shape[-1]
+    assert x.is_contiguous() and norm.weight is not None and norm.weight.shape == (N,)
+    if update is not None:
+        assert scale is not None and update.is_contiguous() and update.shape == x.shape
+    res = torch.empty_like(x) if update is not None else x
+    out = torch.empty_like(x)
+    if x.numel():
+        _add_layer_norm[(x.numel() // N,)](
+            x,
+            update if update is not None else x,
+            scale if scale is not None else norm.weight,
+            norm.weight,
+            norm.bias if norm.bias is not None else norm.weight,
+            res,
+            out,
+            N,
+            float(norm.eps),
+            triton.next_power_of_2(N),
+            update is not None,
+            norm.bias is not None,
+            USE_PDL=_USE_PDL,
+            launch_pdl=_USE_PDL,
+            num_warps=4 if N <= 2048 else 8,
+        )
+    return res, out
+
+
 def enable_gelu_epilogue(model: nn.Module) -> int:
     """Fuse each eligible CUDA FFN GELU into its up-projection GEMM.
 
@@ -1518,7 +1656,7 @@ class MossAudioTokenizerTransformer(StreamingModule):
             state.offsets.index_copy_(0, execution_context.state_slot_ids, next_offsets)
 
     def _fused_norm_ready(self, x: torch.Tensor, execution_context) -> bool:
-        if not x.is_cuda or not x.is_contiguous() or torch.compiler.is_compiling():
+        if not x.is_cuda or not x.is_contiguous():
             return False
         # Layers track a CPU offset only on the slot-less streaming path.
         if execution_context is None and any(layer._streaming_state is not None for layer in self.layers):
@@ -1532,8 +1670,6 @@ class MossAudioTokenizerTransformer(StreamingModule):
         ``x += ls1 * attn`` and ``norm2``, the FFN, then one kernel for
         ``x += ls2 * ffn`` and the next layer's ``norm1``.
         """
-        from .fused_ops import add_layer_norm
-
         layers = self.layers
         x, h = add_layer_norm(x, None, None, layers[0].norm1)
         shared_attn_bias = None

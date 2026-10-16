@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
-from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.logger import init_logger
 
 from .first_frame_special import StatelessFirstGraphs, specialize
@@ -53,7 +53,6 @@ class MossFirstFrameDecoder(nn.Module):
             self._num_quantizers,
             batch_sizes,
             warmups=compilation.cudagraph_num_of_warmups,
-            compiled=compilation.mode == CompilationMode.VLLM_COMPILE,
         )
         return set(dict(self.named_parameters()))
 

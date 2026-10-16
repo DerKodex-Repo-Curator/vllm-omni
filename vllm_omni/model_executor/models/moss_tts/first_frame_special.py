@@ -139,7 +139,15 @@ class StatelessFirstGraphs:
     """Fixed shapes and private graph memory; every returned PCM owns storage."""
 
     @torch.inference_mode()
-    def __init__(self, codec, num_quantizers: int, batch_sizes: tuple[int, ...], *, warmups: int):
+    def __init__(
+        self,
+        codec,
+        num_quantizers: int,
+        batch_sizes: tuple[int, ...],
+        *,
+        warmups: int,
+        compiled: bool = True,
+    ):
         self.codec = codec
         self.entries = {}
         self.batch_sizes = batch_sizes
@@ -150,11 +158,15 @@ class StatelessFirstGraphs:
         self._decode = decode
         if not batch_sizes:
             return
-        self.compiled = torch.compile(
-            decode,
-            dynamic=False,
-            fullgraph=True,
-            options={"triton.cudagraphs": False, "epilogue_fusion": False, "emulate_precision_casts": True},
+        self.compiled = (
+            torch.compile(
+                decode,
+                dynamic=False,
+                fullgraph=True,
+                options={"triton.cudagraphs": False, "epilogue_fusion": False, "emulate_precision_casts": True},
+            )
+            if compiled
+            else decode
         )
         device = next(codec.parameters()).device
         stream = torch.cuda.Stream(device=device)

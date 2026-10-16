@@ -1328,6 +1328,10 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             vllm_config=vllm_config,
             prefix=_maybe_prefix(prefix, "model"),
         )
+        from .fused_ops import fuse_qwen3_qk_norm_rope
+
+        fused = fuse_qwen3_qk_norm_rope(self.model, vllm_config)
+        logger.info("MOSS Local backbone fused Q/K norm + RoPE: %d layers", fused)
 
         # Real text LM head -- loaded from the checkpoint but never consulted
         # at inference (see class docstring); kept purely as a destination
@@ -1865,7 +1869,12 @@ class MossTTSLocalTalkerForGeneration(nn.Module):
             torch.float16,
         ):
             self.local_transformer.prepare_qkv_lookup(self.audio_embeddings, self.n_vq)
-        if not self.vllm_config.model_config.enforce_eager:
+        from vllm.config import CompilationMode
+
+        if (
+            not self.vllm_config.model_config.enforce_eager
+            and self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
+        ):
             self.local_transformer.setup_compile()
 
         logger.info(

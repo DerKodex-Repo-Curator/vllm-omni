@@ -294,6 +294,13 @@ class MossTTSLocalDepthTransformer(nn.Module):
             else:
                 hidden = hidden + block.mlp.fc_out(intermediate)
             return self.ln_f(hidden)
+        if hidden.is_cuda and not torch.compiler.is_compiling():
+            # Each residual add fused with the LayerNorm after it.
+            from vllm_omni.model_executor.models.moss_tts.fused_ops import add_layer_norm
+
+            hidden, x = add_layer_norm(hidden.contiguous(), block.attn.c_proj(attn_output), None, block.ln_2)
+            _, out = add_layer_norm(hidden, block.mlp(x), None, self.ln_f)
+            return out
         hidden = hidden + block.attn.c_proj(attn_output)
         hidden = hidden + block.mlp(block.ln_2(hidden))
         return self.ln_f(hidden)

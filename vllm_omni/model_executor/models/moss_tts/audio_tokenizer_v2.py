@@ -972,12 +972,20 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
 
         projected = apply_weights_per_step(self.in_projs, self.weights_per_step_schedule, query, offset_cpu)
         dim_per_head = self.embed_dim // self.num_heads
-        projected = projected.reshape(B, T, 3, self.num_heads, dim_per_head).permute(2, 0, 3, 1, 4)
-        q, k, v = projected[0], projected[1], projected[2]
+        projected = projected.reshape(B, T, 3, self.num_heads, dim_per_head)
+        table = execution_context.rope_table if execution_context is not None and self.rope else None
+        if table is not None and projected.is_cuda and not torch.compiler.is_compiling():
+            # One kernel rotates Q and K in place from the stage's shared table.
+            from .fused_ops import rope_qk_
 
-        if self.rope:
-            table = execution_context.rope_table if execution_context is not None else None
-            q, k = self.rope(q, k, offset, time_before_heads=False, table=table)
+            rope_qk_(projected, *table)
+            projected = projected.permute(2, 0, 3, 1, 4)
+            q, k, v = projected[0], projected[1], projected[2]
+        else:
+            projected = projected.permute(2, 0, 3, 1, 4)
+            q, k, v = projected[0], projected[1], projected[2]
+            if self.rope:
+                q, k = self.rope(q, k, offset, time_before_heads=False, table=table)
 
         slot_attention = getattr(self, "_slot_attention", None)
         slot_attention_rows = getattr(self, "_slot_attention_rows", None)
@@ -1252,6 +1260,27 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
             return torch.addcmul(x_orig.to(update.dtype), update, self.layer_scale_2.scale)
         return x_orig.to(update.dtype) + self.layer_scale_2(update)
 
+    def _ff_update(self, x: torch.Tensor) -> torch.Tensor:
+        """The FFN of ``_ff_block`` on already-normalized ``x``, without the residual."""
+        gelu_bias = getattr(self, "_gelu_epilogue_bias", None)
+        if gelu_bias is not None:
+            weight = self.linear1.weight
+            hidden = linear_gelu_epilogue(x.reshape(-1, x.shape[-1]).to(weight.dtype), weight, gelu_bias)
+            return self.linear2(hidden.view(*x.shape[:-1], hidden.shape[-1]))
+        return self.linear2(self.activation(self.linear1(x)))
+
+    @property
+    def fused_norm_ready(self) -> bool:
+        """LayerNorm + layer-scale layer whose residual adds can fuse with its norms."""
+        return (
+            self.gating is None
+            and not self.weights_per_step
+            and isinstance(self.norm1, nn.LayerNorm)
+            and isinstance(self.norm2, nn.LayerNorm)
+            and isinstance(self.layer_scale_1, MossAudioTokenizerLayerScale)
+            and isinstance(self.layer_scale_2, MossAudioTokenizerLayerScale)
+        )
+
     def _sa_block(
         self,
         x: torch.Tensor,
@@ -1452,6 +1481,9 @@ class MossAudioTokenizerTransformer(StreamingModule):
             )
             execution_context = dataclasses.replace(execution_context, rope_table=table)
 
+        if self._fused_norm_ready(x, execution_context):
+            return self._forward_fused_layers(x, state, offsets, metadata, execution_context, T)
+
         shared_attn_bias: torch.Tensor | None = None
         try:
             for i, layer in enumerate(self.layers):
@@ -1466,19 +1498,60 @@ class MossAudioTokenizerTransformer(StreamingModule):
             for layer in self.layers:
                 layer.self_attn._cached_attn_bias = None
 
-        if state is not None:
-            assert isinstance(state, TransformerState)
-            if execution_context is None:
-                state.offsets[:] = torch.where(state.exec_mask, state.offsets + T, state.offsets)
-            elif metadata is not None:
-                from .codec_kv_state import commit_offsets
+        self._advance_offsets(state, offsets, metadata, execution_context, T)
+        return x
 
-                commit_offsets(
-                    metadata.next_offsets, state.offsets, execution_context.state_slot_ids, execution_context.valid_rows
-                )
-            else:
-                next_offsets = torch.where(execution_context.valid_rows, offsets + T, offsets)
-                state.offsets.index_copy_(0, execution_context.state_slot_ids, next_offsets)
+    def _advance_offsets(self, state, offsets, metadata, execution_context, frames: int) -> None:
+        if state is None:
+            return
+        assert isinstance(state, TransformerState)
+        if execution_context is None:
+            state.offsets[:] = torch.where(state.exec_mask, state.offsets + frames, state.offsets)
+        elif metadata is not None:
+            from .codec_kv_state import commit_offsets
+
+            commit_offsets(
+                metadata.next_offsets, state.offsets, execution_context.state_slot_ids, execution_context.valid_rows
+            )
+        else:
+            next_offsets = torch.where(execution_context.valid_rows, offsets + frames, offsets)
+            state.offsets.index_copy_(0, execution_context.state_slot_ids, next_offsets)
+
+    def _fused_norm_ready(self, x: torch.Tensor, execution_context) -> bool:
+        if not x.is_cuda or not x.is_contiguous() or torch.compiler.is_compiling():
+            return False
+        # Layers track a CPU offset only on the slot-less streaming path.
+        if execution_context is None and any(layer._streaming_state is not None for layer in self.layers):
+            return False
+        return len(self.layers) > 0 and all(layer.fused_norm_ready for layer in self.layers)
+
+    def _forward_fused_layers(self, x, state, offsets, metadata, execution_context, frames: int):
+        """The layer loop with every residual add fused into the next LayerNorm.
+
+        Per layer: attention on ``norm1(x)``, then one kernel for
+        ``x += ls1 * attn`` and ``norm2``, the FFN, then one kernel for
+        ``x += ls2 * ffn`` and the next layer's ``norm1``.
+        """
+        from .fused_ops import add_layer_norm
+
+        layers = self.layers
+        x, h = add_layer_norm(x, None, None, layers[0].norm1)
+        shared_attn_bias = None
+        try:
+            for i, layer in enumerate(layers):
+                update = layer.self_attn(h, h, h, execution_context=execution_context, attn_bias=shared_attn_bias)
+                if self._share_attn_bias and i == 0:
+                    shared_attn_bias = layer.self_attn._cached_attn_bias
+                x, h = add_layer_norm(x, update.contiguous(), layer.layer_scale_1.scale, layer.norm2)
+                update = layer._ff_update(h)
+                if i + 1 < len(layers):
+                    x, h = add_layer_norm(x, update.contiguous(), layer.layer_scale_2.scale, layers[i + 1].norm1)
+                else:
+                    x = torch.addcmul(x, update, layer.layer_scale_2.scale)
+        finally:
+            for layer in layers:
+                layer.self_attn._cached_attn_bias = None
+        self._advance_offsets(state, offsets, metadata, execution_context, frames)
         return x
 
 
